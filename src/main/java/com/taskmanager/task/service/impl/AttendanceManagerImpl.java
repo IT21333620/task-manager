@@ -1,8 +1,8 @@
 package com.taskmanager.task.service.impl;
 
+import com.couchbase.client.core.deps.com.fasterxml.jackson.databind.ObjectMapper;
 import com.taskmanager.task.entity.*;
 import com.taskmanager.task.model.Attendance.*;
-import com.taskmanager.task.model.Payroll.AllLeaveReportObject;
 import com.taskmanager.task.repository.*;
 import com.taskmanager.task.response.AttendanceDateRangeObj;
 import com.taskmanager.task.response.ResponseList;
@@ -12,11 +12,15 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
-import java.time.format.TextStyle;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -388,112 +392,318 @@ public class AttendanceManagerImpl implements AttendanceManager {
         return responseList;
     }
 
+
     @Override
     public ResponseList updateWithYesterdayAttendance(int id) {
+        LocalDateTime targetDate = null;
+        String apiUrl = null;
 
-        Date date = new Date(System.currentTimeMillis() - 24 * 60 * 60 * 1000 * id);
+        if (id >= 0) {
+            LocalDate yesterday = LocalDate.now().minusDays(id);
+            targetDate = yesterday.atStartOfDay();
+            apiUrl = "http://localhost:8080/api/v/attendance/passAttendance/" + targetDate;
 
-        SimpleDateFormat convertDateToDateOnly = new SimpleDateFormat("yyyy-MM-dd");
-        SimpleDateFormat convertDateToDateOnlyWithTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-
-        SimpleDateFormat convertDateToTime = new SimpleDateFormat("HH:mm:ss");
-
-        String url = "http://localhost:8085/main-erp/get-my-yesterday-attendance/"+id;
-
-        RestTemplate restTemplate = new RestTemplate();
-
-        ArrayList newList = ((ArrayList) restTemplate.getForObject(url, Map.class).get("data"));
-
-        List<YesterdayAttendance> erpAttendances = new ArrayList<>();
-
-
-        for (Object tempObj : newList) {
-
-            YesterdayAttendance yesterdayAttendance = new YesterdayAttendance();
-            LinkedHashMap<String, String> temp = (LinkedHashMap) tempObj;
-            yesterdayAttendance.setId(Integer.valueOf(String.valueOf(temp.get("id"))));
-            yesterdayAttendance.setEmpId(Integer.valueOf(String.valueOf(temp.get("employeeId"))));
-            yesterdayAttendance.setDate(String.valueOf(temp.get("dateTimeFullText")));
-            erpAttendances.add(yesterdayAttendance);
-
+        } else {
+            ResponseList responseList = new ResponseList();
+            responseList.setCode(400);
+            responseList.setMsg("Invalid ID. Please Enter 0 or 1");
+            return responseList;
         }
 
-        List<EmpDetailEntity> peopleList = empDetailRepository.findAll();
+        try {
+            URL url = new URL(apiUrl);
 
-        Map<Integer, List<YesterdayAttendance>> groupedList = erpAttendances.stream().collect(groupingBy(YesterdayAttendance::getEmpId));
+            // Open a connection to the URL
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
 
-        List<AttendanceEntity> attendanceObj = new ArrayList<>();
+            // Read the response
+            BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+            StringBuilder response = new StringBuilder();
+            String line;
 
-        peopleList.forEach(empDetailEntity -> {
+            while ((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            reader.close();
 
-            try {
+            // Process the response and return it
+            ResponseList responseList = new ResponseList();
+            responseList.setCode(200);
+            responseList.setMsg("Valid");
 
+            // Convert the response JSON into a map
+            Map<Integer, Map<String, String>> mapAttendance = processApiResponse(response.toString());
 
-                if (groupedList.containsKey(Integer.valueOf(empDetailEntity.getSerialNumber()))) {
+            List<AttendanceEntity> attendanceObj = new ArrayList<>();
 
+            for (Map.Entry<Integer, Map<String, String>> entry : mapAttendance.entrySet()) {
+                int empId = entry.getKey();
+                Map<String, String> data = entry.getValue();
+
+                String inTime = data.get("inTime");
+                String outTime = data.get("outTime");
+                String inDate = data.get("date");
+
+                String dateFormatPattern = "yyyy-MM-dd";
+
+                EmpDetailEntity person = empDetailRepository.findBySerialNumber(String.valueOf(empId));
+
+                if (person != null) {
                     AttendanceEntity attendance = new AttendanceEntity();
-                    attendance.setName(empDetailEntity.getGivenName());
-                    attendance.setEmpId(empDetailEntity.getId());
-                    try {
-                        attendance.setDate(convertDateToDateOnly.parse(convertDateToDateOnly.format(date)));
-                    } catch (ParseException e) {
-                        throw new RuntimeException(e);
-                    }
-                    List<YesterdayAttendance> timeList = groupedList.get(Integer.valueOf(empDetailEntity.getSerialNumber()));
+                    attendance.setName(person.getGivenName());
+                    attendance.setEmpId(Integer.parseInt(String.valueOf(person.getId())));
 
-                    Comparator<YesterdayAttendance> comparator = (c1, c2) -> {
-                        return Integer.valueOf(c1.getId()).compareTo(c2.getId());
-                    };
-                    Collections.sort(timeList, comparator);
-                    if (timeList.size() == 1) {
-                        attendance.setInTime(convertDateToTime.format(convertDateToDateOnlyWithTime.parse(timeList.get(0).getDate())));
+                    if (inTime != null && outTime != null) {
+                        attendance.setInTime(inTime);
+                        attendance.setOutTime(outTime);
+
+                        try {
+                            Date date = parseDate(inDate, dateFormatPattern);
+                            attendance.setDate(date);
+                        } catch (ParseException e) {
+
+                        }
+                        long workingTime = calculateWorkDuration(inTime, outTime);
+                        attendance.setWorkDuration(workingTime);
+                        attendance.setType("Added By System");
+
+
+                    } else if (inTime == null && outTime != null) {
+                        attendance.setInTime("");
+                        attendance.setOutTime(outTime);
+                        attendance.setWorkDuration(0);
+                        attendance.setType("Added By System");
+                        try {
+                            Date date = parseDate(inDate, dateFormatPattern);
+                            attendance.setDate(date);
+                        } catch (ParseException e) {
+
+                        }
+
+                    } else if (inTime != null && outTime == null) {
+                        attendance.setInTime(inTime);
                         attendance.setOutTime("");
-                        attendance.setStatus(1);
-                    } else {
-                        attendance.setStatus(3);
-                        attendance.setInTime(convertDateToTime.format(convertDateToDateOnlyWithTime.parse(timeList.get(0).getDate())));
-                        attendance.setOutTime(convertDateToTime.format(convertDateToDateOnlyWithTime.parse(timeList.get(timeList.size() - 1).getDate())));
+                        attendance.setWorkDuration(0);
+                        attendance.setType("Added By System");
+                        try {
+                            Date date = parseDate(inDate, dateFormatPattern);
+                            attendance.setDate(date);
+                        } catch (ParseException e) {
+
+                        }
                     }
 
-                    attendance.setWorkDuration(0l);
-                    attendance.setType("Added By System");
-
-                    attendanceObj.add(attendance);
-                } else {
-                    AttendanceEntity attendance = new AttendanceEntity();
-                    attendance.setName(empDetailEntity.getGivenName());
-                    attendance.setEmpId(empDetailEntity.getId());
-                    try {
-                        attendance.setDate(convertDateToDateOnly.parse(convertDateToDateOnly.format(date)));
-                    } catch (ParseException e) {
-                        throw new RuntimeException(e);
-                    }
-
-                    attendance.setInTime("");
-                    attendance.setOutTime("");
-
-                    attendance.setWorkDuration(0l);
-                    attendance.setType("Added By System");
-                    attendance.setStatus(1);
-                    attendance.setApplyLate(0);
                     attendanceObj.add(attendance);
                 }
             }
-            catch (Exception e){
 
+            // Save all attendance records after the loop
+            attendanceRepository.saveAll(attendanceObj);
+
+            responseList.setData(mapAttendance);
+            return responseList;
+
+        } catch (IOException e) {
+            e.printStackTrace();
+            ResponseList responseList = new ResponseList();
+            responseList.setCode(500);
+            responseList.setMsg("Error occurred");
+            return responseList;
+        }
+
+
+
+//        Date date = new Date(System.currentTimeMillis() - 24 * 60 * 60 * 1000 * id);
+//
+//        SimpleDateFormat convertDateToDateOnly = new SimpleDateFormat("yyyy-MM-dd");
+//        SimpleDateFormat convertDateToDateOnlyWithTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+//
+//        SimpleDateFormat convertDateToTime = new SimpleDateFormat("HH:mm:ss");
+//
+//        String url = "http://localhost:8085/main-erp/get-my-yesterday-attendance/"+id;
+//
+//        RestTemplate restTemplate = new RestTemplate();
+//
+//        ArrayList newList = ((ArrayList) restTemplate.getForObject(url, Map.class).get("data"));
+//
+//        List<YesterdayAttendance> erpAttendances = new ArrayList<>();
+//
+//
+//        for (Object tempObj : newList) {
+//
+//            YesterdayAttendance yesterdayAttendance = new YesterdayAttendance();
+//            LinkedHashMap<String, String> temp = (LinkedHashMap) tempObj;
+//            yesterdayAttendance.setId(Integer.valueOf(String.valueOf(temp.get("id"))));
+//            yesterdayAttendance.setEmpId(Integer.valueOf(String.valueOf(temp.get("employeeId"))));
+//            yesterdayAttendance.setDate(String.valueOf(temp.get("dateTimeFullText")));
+//            erpAttendances.add(yesterdayAttendance);
+//
+//        }
+//
+//        List<EmpDetailEntity> peopleList = empDetailRepository.findAll();
+//
+//        Map<Integer, List<YesterdayAttendance>> groupedList = erpAttendances.stream().collect(groupingBy(YesterdayAttendance::getEmpId));
+//
+//        List<AttendanceEntity> attendanceObj = new ArrayList<>();
+//
+//        peopleList.forEach(empDetailEntity -> {
+//
+//            try {
+//
+//
+//                if (groupedList.containsKey(Integer.valueOf(empDetailEntity.getSerialNumber()))) {
+//
+//                    AttendanceEntity attendance = new AttendanceEntity();
+//                    attendance.setName(empDetailEntity.getGivenName());
+//                    attendance.setEmpId(empDetailEntity.getId());
+//                    try {
+//                        attendance.setDate(convertDateToDateOnly.parse(convertDateToDateOnly.format(date)));
+//                    } catch (ParseException e) {
+//                        throw new RuntimeException(e);
+//                    }
+//                    List<YesterdayAttendance> timeList = groupedList.get(Integer.valueOf(empDetailEntity.getSerialNumber()));
+//
+//                    Comparator<YesterdayAttendance> comparator = (c1, c2) -> {
+//                        return Integer.valueOf(c1.getId()).compareTo(c2.getId());
+//                    };
+//                    Collections.sort(timeList, comparator);
+//                    if (timeList.size() == 1) {
+//                        attendance.setInTime(convertDateToTime.format(convertDateToDateOnlyWithTime.parse(timeList.get(0).getDate())));
+//                        attendance.setOutTime("");
+//                        attendance.setStatus(1);
+//                    } else {
+//                        attendance.setStatus(3);
+//                        attendance.setInTime(convertDateToTime.format(convertDateToDateOnlyWithTime.parse(timeList.get(0).getDate())));
+//                        attendance.setOutTime(convertDateToTime.format(convertDateToDateOnlyWithTime.parse(timeList.get(timeList.size() - 1).getDate())));
+//                    }
+//
+//                    attendance.setWorkDuration(0l);
+//                    attendance.setType("Added By System");
+//
+//                    attendanceObj.add(attendance);
+//                } else {
+//                    AttendanceEntity attendance = new AttendanceEntity();
+//                    attendance.setName(empDetailEntity.getGivenName());
+//                    attendance.setEmpId(empDetailEntity.getId());
+//                    try {
+//                        attendance.setDate(convertDateToDateOnly.parse(convertDateToDateOnly.format(date)));
+//                    } catch (ParseException e) {
+//                        throw new RuntimeException(e);
+//                    }
+//
+//                    attendance.setInTime("");
+//                    attendance.setOutTime("");
+//
+//                    attendance.setWorkDuration(0l);
+//                    attendance.setType("Added By System");
+//                    attendance.setStatus(1);
+//                    attendance.setApplyLate(0);
+//                    attendanceObj.add(attendance);
+//                }
+//            }
+//            catch (Exception e){
+//
+//            }
+//
+//
+//        });
+//
+//        attendanceRepository.saveAll(attendanceObj);
+//
+//        ResponseList responseList = new ResponseList();
+//        responseList.setCode(200);
+//        responseList.setMsg("Success");
+//        return responseList;
+//        return null;
+    }
+
+
+    public Date parseDate(String dateStr, String pattern) throws ParseException {
+        SimpleDateFormat dateFormat = new SimpleDateFormat(pattern);
+        return dateFormat.parse(dateStr);
+    }
+
+    private long calculateWorkDuration(String inTime, String outTime) {
+
+        try {
+            LocalTime startTime = LocalTime.parse(inTime);
+            LocalTime endTime = LocalTime.parse(outTime);
+            Duration duration = Duration.between(startTime, endTime);
+            return duration.getSeconds();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return 0L;
+        }
+    }
+
+    public Map<Integer, Map<String, String>> processApiResponse(String response) {
+        Map<Integer, Map<String, String>> result = new HashMap<>();
+
+        try {
+            ObjectMapper objectMapper = new ObjectMapper();
+            Map<String, Map<String, String>> apiResponse = objectMapper.readValue(response, Map.class);
+
+            for (Map.Entry<String, Map<String, String>> entry : apiResponse.entrySet()) {
+                int empId = Integer.parseInt(entry.getKey());
+                Map<String, String> data = entry.getValue();
+                result.put(empId, data);
             }
 
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
 
-        });
-
-        attendanceRepository.saveAll(attendanceObj);
-
-        ResponseList responseList = new ResponseList();
-        responseList.setCode(200);
-        responseList.setMsg("Success");
-        return responseList;
-
+        return result;
     }
+
+    private float calculateMorningLate(String inTime) {
+
+        try {
+            LocalTime punchInTime = LocalTime.parse(inTime);
+
+            // Define the reference time (8:00 AM)
+            LocalTime referenceTime = LocalTime.of(8, 0);
+
+            // Calculate the duration between the punch in time and 8:00 AM
+            Duration duration = Duration.between(referenceTime, punchInTime);
+            float minutesLate = duration.toMinutes();
+            return minutesLate;
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return -1.0f;
+        }
+    }
+
+
+    private String calculateOvertime(long workingTimeInSeconds) {
+        try {
+            // Define the standard working hours (e.g., 9 hours) in seconds
+            long standardWorkingHoursInSeconds = 9 * 60 * 60;
+
+            // Calculate overtime if working time is greater than the standard hours
+            if (workingTimeInSeconds > standardWorkingHoursInSeconds) {
+                long overtimeInSeconds = workingTimeInSeconds - standardWorkingHoursInSeconds;
+
+                // Convert overtime duration to a formatted string
+                long hours = overtimeInSeconds / 3600;
+                long minutes = (overtimeInSeconds % 3600) / 60;
+                long seconds = overtimeInSeconds % 60;
+
+                return String.format("%02d:%02d:%02d", hours, minutes, seconds);
+
+            } else {
+                return "00:00:00";
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "N/A";
+        }
+    }
+
+
 
     @Override
     public ResponseList updateWithYesterdayAttendanceForUserId(int idUser, String start, String end) {
