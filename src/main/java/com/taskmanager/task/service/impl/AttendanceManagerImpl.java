@@ -24,6 +24,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static java.util.stream.Collectors.groupingBy;
 
@@ -500,6 +501,59 @@ public class AttendanceManagerImpl implements AttendanceManager {
 
             // Save all attendance records after the loop
             attendanceRepository.saveAll(attendanceObj);
+
+            List<Integer> attendanceEmployeeIds = new ArrayList<>(mapAttendance.keySet());
+
+// Fetch the list of all employees from the EmpDetailRepository
+            List<EmpDetailEntity> peopleList = empDetailRepository.findAll();
+
+// Extract the serial numbers of all employees
+            List<String> employeeSerialNumbers = new ArrayList<>();
+            for (EmpDetailEntity person : peopleList) {
+                if (person.getSerialNumber() != null) {  // Ensure serialNumber is not null
+                    employeeSerialNumbers.add(person.getSerialNumber());
+                }
+            }
+
+            employeeSerialNumbers = employeeSerialNumbers.stream()
+                    .filter(serialNumber -> !serialNumber.equals("0"))
+                    .collect(Collectors.toList());
+
+// Identify the serial numbers not present in mapAttendance
+            List<String> serialNumbersNotInAttendance = new ArrayList<>();
+            for (String serialNumber : employeeSerialNumbers) {
+                if (!attendanceEmployeeIds.contains(Integer.parseInt(serialNumber))) {
+                    serialNumbersNotInAttendance.add(serialNumber);
+                }
+            }
+
+// Create AttendanceEntity objects for employees not in mapAttendance
+            List<AttendanceEntity> missingAttendanceEntities = new ArrayList<>();
+            for (String serialNumber : serialNumbersNotInAttendance) {
+                EmpDetailEntity person = peopleList.stream()
+                        .filter(p -> p != null && serialNumber != null && serialNumber.equals(p.getSerialNumber()))
+                        .findFirst()
+                        .orElse(null);
+
+                if (person != null) {
+                    AttendanceEntity attendance = new AttendanceEntity();
+                    attendance.setName(person.getGivenName());
+
+                    LocalDate yesterday = LocalDate.now().minusDays(id);
+                    Date dateYesterday = Date.from(yesterday.atStartOfDay(ZoneId.systemDefault()).toInstant());
+
+                    attendance.setEmpId(person.getId());
+                    attendance.setDate(dateYesterday);
+                    attendance.setInTime("");
+                    attendance.setOutTime("");
+                    attendance.setWorkDuration(0);
+                    attendance.setType("Added By System");
+                    missingAttendanceEntities.add(attendance);
+                }
+            }
+
+// Save the missing attendance records to the repository
+            attendanceRepository.saveAll(missingAttendanceEntities);
 
             responseList.setData(mapAttendance);
             return responseList;
